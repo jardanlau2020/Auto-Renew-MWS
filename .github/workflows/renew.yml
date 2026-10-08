@@ -28,11 +28,11 @@ jobs:
       #    = 每次執行第三方腳本，供應鏈風險。已改為：只在有 NODE_LINK 時才用
       #    官方 GitHub Release 的 sing-box（版本釘死），唔再拉第三方腳本。
       - name: ⚙ 可选代理（sing-box，官方 release，版本钉死）
-        if: ${{ secrets.NODE_LINK != '' }}
         continue-on-error: true
         env:
           NODE_LINK: ${{ secrets.NODE_LINK }}
         run: |
+          if [ -z "$NODE_LINK" ]; then echo "ℹ️ 未設定 NODE_LINK，跳過代理（直連）"; exit 0; fi
           set -e
           SBV=1.11.0
           wget -qO sb.tar.gz "https://github.com/SagerNet/sing-box/releases/download/v${SBV}/sing-box-${SBV}-linux-amd64.tar.gz"
