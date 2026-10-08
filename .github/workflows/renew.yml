@@ -1,9 +1,7 @@
-
 name: Auto Renew MWS
-
 on:
-  schedule: 
-    - cron: '30 22 */6 * *' # 每6天UTC 22:30 (北京时间6点半, 一般都会推迟8点之后运行),可自行调整
+  schedule:
+    - cron: '30 22 */6 * *'   # 每 6 日（北京 06:30）
   workflow_dispatch:
 
 jobs:
@@ -12,7 +10,6 @@ jobs:
     permissions:
       actions: write
       contents: write
-
     steps:
       - uses: actions/checkout@v6
 
@@ -21,18 +18,52 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: 🛠️ 安装系统依赖和 Python 依赖
+      - name: 🛠️ 安装依赖
         run: |
           sudo apt-get update -y
           sudo apt-get install -y jq wget
           pip install curl_cffi
 
-      - name: ⚙ 设置代理 (sing-box)
+      # ⚠️ 原版呢步係 bash <(wget -qO- https://main.ssss.nyc.mn/setup_proxy.sh)
+      #    = 每次執行第三方腳本，供應鏈風險。已改為：只在有 NODE_LINK 時才用
+      #    官方 GitHub Release 的 sing-box（版本釘死），唔再拉第三方腳本。
+      - name: ⚙ 可选代理（sing-box，官方 release，版本钉死）
+        if: ${{ secrets.NODE_LINK != '' }}
         continue-on-error: true
         env:
           NODE_LINK: ${{ secrets.NODE_LINK }}
         run: |
-          bash <(wget -qO- https://main.ssss.nyc.mn/setup_proxy.sh)
+          set -e
+          SBV=1.11.0
+          wget -qO sb.tar.gz "https://github.com/SagerNet/sing-box/releases/download/v${SBV}/sing-box-${SBV}-linux-amd64.tar.gz"
+          tar -xzf sb.tar.gz
+          cp "sing-box-${SBV}-linux-amd64/sing-box" ./sing-box
+          chmod +x ./sing-box
+          python3 - <<'PY'
+          import os, json, base64, urllib.parse
+          link = os.environ.get("NODE_LINK","").strip()
+          def q(s):
+              p = urllib.parse.urlparse(s)
+              return dict(host=p.hostname, port=p.port or 443, q=urllib.parse.parse_qs(p.query))
+          out = {"log":{"level":"warn"},"inbounds":[{"type":"mixed","tag":"in","listen":"127.0.0.1","listen_port":1081}],"outbounds":[]}
+          if link.startswith("vless://"):
+              u = q(link); p = urllib.parse.urlparse(link)
+              ob = {"type":"vless","tag":"out","server":u["host"],"server_port":u["port"],"uuid":p.username,
+                    "tls":{"enabled":u["q"].get("security",["none"])[0]=="tls",
+                           "server_name":(u["q"].get("sni") or u["q"].get("host") or [u["host"]])[0],
+                           "utls":{"enabled":True,"fingerprint":(u["q"].get("fp") or ["chrome"])[0]}}}
+              if (u["q"].get("type") or ["tcp"])[0] == "ws":
+                  ob["transport"] = {"type":"ws","path":(u["q"].get("path") or ["/"])[0].replace("%2F","/"),
+                                     "headers":{"Host":(u["q"].get("host") or [u["host"]])[0]}}
+              out["outbounds"].append(ob)
+          else:
+              raise SystemExit("只支援 vless:// 链接")
+          json.dump(out, open("sing-box-config.json","w"), indent=1)
+          print("sing-box config ready for", u["host"])
+          PY
+          ./sing-box run -c sing-box-config.json > sing-box.log 2>&1 &
+          sleep 4
+          curl -s -m 10 -x http://127.0.0.1:1081 -o /dev/null -w "proxy check http=%{http_code}\n" https://www.gstatic.com/generate_204 || true
 
       - name: 🚀 运行续期脚本
         env:
@@ -47,37 +78,17 @@ jobs:
         run: |
           python3 app.py
 
-      - name: 🧽 清理进程和临时文件
+      - name: 🧽 清理
         if: always()
         run: |
           pkill -f sing-box || true
-          rm -f sing-box sing-box-config.json sing-box.log
+          rm -f sing-box sing-box-config.json sing-box.log sb.tar.gz
 
-      # 更新时间到time.txt,避免6个月未更新导致工作流暂停
       - name: 🕒 提交运行时间
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          echo "$(TZ=Asia/Shanghai date +'%Y-%m-%d %H:%M:%S')" > time.txt
+          date '+%Y-%m-%d %H:%M:%S' > time.txt
           git add time.txt
-          if git diff --cached --quiet; then
-            echo "No need to commit"
-          else
-            git commit -m "⏱️ Auto Update by Github Actions $(TZ=Asia/Shanghai date +'%Y-%m-%d %H:%M:%S')"
-            git push origin main
-          fi
-          
-      - name: 🧹 清理旧的工作流运行记录
-        if: always()
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          runs=$(gh run list --workflow="${{ github.workflow }}" --limit=100 --json databaseId --jq '.[].databaseId')
-          count=0
-          for run_id in $runs; do
-            count=$((count + 1))
-            if [ $count -gt 1 ]; then
-              echo "删除运行记录: $run_id"
-              gh run delete $run_id || true
-            fi
-          done
+          git diff --quiet && git diff --staged --quiet || git commit -m "chore: update run time"
+          git push || true
