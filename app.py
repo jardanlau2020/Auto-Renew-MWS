@@ -4,6 +4,7 @@
 import os
 import re
 import json
+import sys
 import time
 import subprocess
 import base64
@@ -136,10 +137,41 @@ def renew_server(server_id: str):
         )
 
         if response.status_code == 200:
+            # 冷王 #89：HTTP 200 不等于续上（后台拒绝、冷却、风控都可能回 200）。
+            # 服务端续期成功会回 timer.remaining_hours，所以 200 之后必须拿到一个
+            # 为正的剩余小时数；拿不到就按失败处理，交回上层走重登/告警。
             try:
-                remaining_hours = response.json().get("timer", {}).get("remaining_hours", "未知")
-            except json.JSONDecodeError:
-                remaining_hours = "未知"
+                payload = response.json()
+            except ValueError:
+                print(f"❌ 服务器 [{server_id}] 返回 200 但 body 不是 JSON，无法确认续期："
+                      f"{response.text[:200]}")
+                return False, response.status_code, None
+
+            if not isinstance(payload, dict):
+                print(f"❌ 服务器 [{server_id}] 返回 200 但 body 结构异常，无法确认续期："
+                      f"{response.text[:200]}")
+                return False, response.status_code, None
+
+            # 明确的失败标记优先于任何「成功」推断
+            for bad_key in ("error", "err", "errors"):
+                if payload.get(bad_key):
+                    print(f"❌ 服务器 [{server_id}] 返回 200 但带错误字段 {bad_key}："
+                          f"{str(payload)[:200]}")
+                    return False, response.status_code, None
+            if payload.get("success") is False or payload.get("ok") is False:
+                print(f"❌ 服务器 [{server_id}] 返回 200 但 success/ok=false："
+                      f"{str(payload)[:200]}")
+                return False, response.status_code, None
+
+            timer = payload.get("timer")
+            remaining_hours = timer.get("remaining_hours") if isinstance(timer, dict) else None
+            if not isinstance(remaining_hours, (int, float)) or isinstance(remaining_hours, bool) \
+                    or remaining_hours <= 0:
+                # 冷王 #89：读不到有效剩余小时数 = 无法确认，不许当成功。
+                # 这里也是原来「remaining_hours 落到 '未知' 字符串还报成功」的位置。
+                print(f"❌ 服务器 [{server_id}] 返回 200 但没拿到有效 remaining_hours"
+                      f"（{remaining_hours!r}），无法确认续期：{str(payload)[:200]}")
+                return False, response.status_code, None
 
             print(f"✅ 服务器 [{server_id}] 续期成功，剩余 {remaining_hours} 小时")
             return True, response.status_code, remaining_hours
@@ -337,11 +369,11 @@ def main():
     server_list = [s_id.strip() for s_id in SERVER_IDS.split(",") if s_id.strip()]
     if not server_list:
         print("❌ 未配置有效的 SERVER_IDS")
-        return
+        return 1
 
     if not COOKIE and not DISCORD_TOKEN:
         print("❌ COOKIE 和 DISCORD_TOKEN 均为空，请添加相关变量后再运行！")
-        return
+        return 1
 
     print(f"🚀 开始续期任务，共 {len(server_list)} 个服务器: {server_list}")
     print(f"🔗 使用代理: {PROXY_SERVER}" if IS_PROXY else "🍭 未使用代理，直连访问")
@@ -378,7 +410,7 @@ def main():
                 f"❌ 续期失败\n👤 账户: {EMAIL}\n"
                 "⚠️ COOKIE 可能已失效，且未配置 DISCORD_TOKEN，无法自动刷新。"
             )
-            return
+            return 1
 
         # 纯 HTTP OAuth（curl_cffi chrome TLS 指纹，无需浏览器）
         new_cookie = fetch_new_cookie_via_http()
@@ -388,7 +420,7 @@ def main():
                 f"❌ 续期失败\n👤 账户: {EMAIL}\n"
                 "⚠️ COOKIE 失效且 Discord OAuth 登录失败，请检查 DISCORD_TOKEN 或代理节点。"
             )
-            return
+            return 1
 
         COOKIE = new_cookie
 
@@ -427,14 +459,21 @@ def main():
             print("ℹ️ 未配置 GH_TOKEN，跳过写入 COOKIE Secret")
             # print(f"📋 如需手动更新，请将 COOKIE 设置为: {new_cookie}")
 
-    print("🏁 脚本执行完毕")
+    if all_ok:
+        print("🏁 脚本执行完毕")
+        return 0
+    # 冷王 #89：有服务器没续上就是失败，别让 run 一直是绿的
+    print("❌ 脚本执行完毕，但有服务器未续期成功")
+    return 1
+
 
 if __name__ == "__main__":
     try:
-        main()
+        sys.exit(main())
     except Exception as e:
         import traceback
         traceback.print_exc()
         send_tg_notification(
             f"🇯🇵 MWS 续期通知\n\n❌ 脚本异常退出\n👤 账户: {EMAIL}\n⚠️ {e}"
         )
+        sys.exit(1)
